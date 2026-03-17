@@ -2768,111 +2768,393 @@ def safe_extract_text(uploaded_file):
         return None
 
 # ============================================================
-# 📐 Industry-Standard Resume Format Checker
+# 📐 Industry-Standard Resume Format Checker (v2 — Enhanced)
 # ============================================================
-def check_resume_format(text: str, num_pages: int = 1) -> dict:
+
+def _detect_multicolumn_pdf(pdf_path: str) -> bool:
     """
-    Evaluates resume against ATS industry-standard formatting rules.
-    Returns a dict with score (0–100), letter_grade, issues list, passes list.
+    Detect multi-column layout by analysing raw text-block x-coordinates
+    from the first page of the PDF via PyMuPDF.
+    Returns True if two or more distinct horizontal content zones are found.
     """
-    issues = []
-    passes = []
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[0]
+        blocks = page.get_text("blocks")   # (x0, y0, x1, y1, text, block_no, block_type)
+        page_width = page.rect.width
+        doc.close()
+
+        # Only consider blocks with meaningful text content
+        x_starts = [b[0] for b in blocks if len(b[4].strip()) > 10]
+        if len(x_starts) < 6:
+            return False
+
+        # Split the page width into left zone (< 45 %) and right zone (> 52 %)
+        left_zone  = [x for x in x_starts if x < page_width * 0.45]
+        right_zone = [x for x in x_starts if x > page_width * 0.52]
+
+        # Multi-column confirmed when both zones carry real content
+        return len(left_zone) >= 3 and len(right_zone) >= 3
+    except Exception:
+        return False
+
+
+def check_resume_format(text: str, num_pages: int = 1, pdf_path: str = None) -> dict:
+    """
+    Evaluates a resume against industry-standard ATS formatting rules.
+
+    Scoring model (100 pts total, deduction-based):
+      Section presence       — up to −42 pts  (critical ATS sections)
+      Contact completeness   — up to −8  pts
+      Resume length          — up to −14 pts
+      Action verb quality    — up to −8  pts
+      Quantified achievements— up to −8  pts
+      ATS red flags          — up to −14 pts  (multi-column, dates, objective)
+      Bonus credits          — up to +4  pts  (certifications, portfolio)
+
+    Returns a dict compatible with all existing callers (same keys as v1).
+    """
+    issues  = []
+    passes  = []
     deductions = 0
+    bonuses    = 0
 
     text_lower = text.lower() if text else ""
 
-    # ── 1. Essential Section Presence (30 pts) ──────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # 1. CRITICAL SECTION PRESENCE  (max −42 pts)
+    #    Weights reflect real ATS auto-reject risk, not equal treatment.
+    # ══════════════════════════════════════════════════════════════════════
     section_checks = {
-        "contact / email":   bool(re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', text or "")),
-        "phone number":      bool(re.search(r'(\+?\d[\d\s\-\(\)]{7,}\d)', text or "")),
-        "experience":        any(w in text_lower for w in ["experience", "employment", "work history", "career"]),
-        "education":         any(w in text_lower for w in ["education", "university", "college", "degree", "bachelor", "master", "b.tech", "b.sc", "m.sc", "mca", "bca"]),
-        "skills":            any(w in text_lower for w in ["skills", "technologies", "tech stack", "competencies", "proficiencies"]),
-        "summary / objective": any(w in text_lower for w in ["summary", "objective", "profile", "about me", "overview"]),
+        # (label, detected, deduction_if_missing)
+        "Contact / Email": (
+            bool(re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', text or "")),
+            15,   # ATS hard-rejects without contact info
+        ),
+        "Phone Number": (
+            bool(re.search(r'(\+?\d[\d\s\-\(\)]{7,}\d)', text or "")),
+            6,
+        ),
+        "Experience": (
+            any(w in text_lower for w in [
+                "experience", "employment", "work history", "career",
+                "professional experience", "work experience",
+                "positions held", "relevant experience", "professional background",
+            ]),
+            12,   # Core content section — high ATS weight
+        ),
+        "Education": (
+            any(w in text_lower for w in [
+                "education", "university", "college", "degree",
+                "bachelor", "master", "b.tech", "b.sc", "m.sc",
+                "mca", "bca", "phd", "diploma", "high school",
+                "graduated", "pursuing",
+            ]),
+            4,
+        ),
+        "Skills": (
+            any(w in text_lower for w in [
+                "skills", "technologies", "tech stack",
+                "competencies", "proficiencies", "tools",
+                "technical skills", "core competencies",
+            ]),
+            3,
+        ),
+        "Summary / Profile": (
+            any(w in text_lower for w in [
+                "summary", "objective", "profile",
+                "about me", "overview", "professional summary",
+                "career objective", "personal statement",
+            ]),
+            2,
+        ),
     }
-    for section_name, present in section_checks.items():
+
+    for section_name, (present, penalty) in section_checks.items():
         if present:
-            passes.append(f"Section present: {section_name.title()}")
+            passes.append(f"Section present: {section_name}")
         else:
-            issues.append(f"Missing section: '{section_name.title()}' — ATS may reject without it")
-            deductions += 5
+            issues.append(
+                f"Missing section: '{section_name}' — "
+                f"ATS {'will likely reject' if penalty >= 10 else 'may penalise'} without it"
+            )
+            deductions += penalty
 
-    # ── 2. Contact Completeness (20 pts) ────────────────────────────────
-    if not re.search(r'linkedin\.com/in/', text_lower):
-        issues.append("No LinkedIn URL — recruiters expect it for verification")
-        deductions += 5
-    else:
+    # ══════════════════════════════════════════════════════════════════════
+    # 2. CONTACT COMPLETENESS  (max −8 pts)
+    # ══════════════════════════════════════════════════════════════════════
+    if re.search(r'linkedin\.com/in/[\w\-]+', text_lower):
         passes.append("LinkedIn profile URL detected")
-
-    if not re.search(r'github\.com/', text_lower):
-        issues.append("No GitHub/Portfolio URL — especially important for tech roles")
-        deductions += 3
     else:
-        passes.append("GitHub/Portfolio URL detected")
-
-    # ── 3. Resume Length (15 pts) ───────────────────────────────────────
-    word_count = len(text.split()) if text else 0
-    if word_count < 200:
-        issues.append(f"Resume too short ({word_count} words) — ATS expects 400–900 words")
-        deductions += 10
-    elif word_count > 1200:
-        issues.append(f"Resume too long ({word_count} words) — trim to under 1,000 words for ATS")
+        issues.append("No LinkedIn URL — recruiters expect it; many ATS rank it as a signal")
         deductions += 5
+
+    if re.search(r'github\.com/[\w\-]+', text_lower):
+        passes.append("GitHub profile URL detected")
+        bonuses += 1   # bonus: shows technical proof of work
+    elif re.search(r'(portfolio|behance\.net|dribbble\.com|leetcode\.com|kaggle\.com)', text_lower):
+        passes.append("Portfolio / professional profile URL detected")
+        bonuses += 1
     else:
-        passes.append(f"Good length ({word_count} words)")
+        issues.append("No GitHub or portfolio URL — especially important for technical roles")
+        deductions += 3
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 3. RESUME LENGTH  (max −14 pts)
+    #    Sweet spot: 400–900 words for most roles.
+    # ══════════════════════════════════════════════════════════════════════
+    word_count = len(text.split()) if text else 0
+
+    if word_count < 150:
+        issues.append(
+            f"Resume critically short ({word_count} words) — "
+            "ATS expects 400–900 words; this will likely be filtered out"
+        )
+        deductions += 12
+    elif word_count < 400:
+        issues.append(
+            f"Resume too short ({word_count} words) — "
+            "aim for 400–900 words with detailed experience and skills"
+        )
+        deductions += 7
+    elif word_count > 1400:
+        issues.append(
+            f"Resume too long ({word_count} words) — "
+            "trim to under 1,000 words; ATS and recruiters prefer concise resumes"
+        )
+        deductions += 5
+    elif word_count > 1000:
+        issues.append(
+            f"Resume slightly long ({word_count} words) — "
+            "consider tightening to under 1,000 words"
+        )
+        deductions += 2
+    else:
+        passes.append(f"Optimal length ({word_count} words — within 400–1,000 word sweet spot)")
 
     if num_pages > 2:
-        issues.append(f"Resume is {num_pages} pages — 1–2 pages is ATS industry standard")
-        deductions += 5
+        issues.append(
+            f"Resume is {num_pages} pages — "
+            "ATS industry standard is 1–2 pages; longer resumes are often truncated"
+        )
+        deductions += 4
+    elif num_pages == 2:
+        passes.append("Page count acceptable (2 pages — standard for 5+ years experience)")
     else:
-        passes.append(f"Page count acceptable ({num_pages} page{'s' if num_pages > 1 else ''})")
+        passes.append("Page count ideal (1 page — strong for early-career candidates)")
 
-    # ── 4. Action Verb Usage (15 pts) ───────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # 4. ACTION VERB QUALITY  (max −8 pts)
+    #    Expanded to 54 verbs across all common resume categories.
+    # ══════════════════════════════════════════════════════════════════════
     strong_verbs = [
+        # Engineering / technical
         "architected", "engineered", "designed", "deployed", "optimized", "automated",
-        "reduced", "increased", "led", "built", "launched", "delivered", "developed",
-        "implemented", "managed", "created", "improved", "spearheaded", "streamlined",
-        "coordinated", "established", "negotiated", "transformed", "integrated",
-        "accelerated", "executed", "mentored", "analyzed", "resolved", "collaborated"
+        "built", "launched", "developed", "implemented", "integrated", "configured",
+        "migrated", "refactored", "debugged", "benchmarked", "containerized", "scaled",
+        "maintained", "upgraded", "tested", "validated",
+        # Leadership / management
+        "led", "managed", "directed", "oversaw", "supervised", "coordinated",
+        "spearheaded", "mentored", "trained", "guided", "facilitated",
+        # Business / impact
+        "reduced", "increased", "improved", "accelerated", "streamlined", "transformed",
+        "negotiated", "established", "executed", "delivered", "created",
+        "resolved", "analyzed", "collaborated", "authored", "published",
+        # Data / research
+        "researched", "evaluated", "identified", "modelled", "forecasted",
+        "presented", "reported", "drafted",
     ]
     found_verbs = [v for v in strong_verbs if re.search(rf'\b{v}\b', text_lower)]
-    if len(found_verbs) < 3:
-        issues.append(f"Weak action verb usage ({len(found_verbs)} found) — use verbs like 'Engineered', 'Optimized', 'Deployed'")
-        deductions += 8
-    else:
-        passes.append(f"Strong action verbs used ({len(found_verbs)} detected)")
+    verb_count = len(found_verbs)
 
-    # ── 5. Quantification (10 pts) ──────────────────────────────────────
-    quant_patterns = re.findall(r'\b\d+[\.,]?\d*\s*(%|percent|x|times|users|clients|projects|hrs|hours|days|weeks|months|years|ms|gb|tb|k\b|\$)', text_lower)
-    if len(quant_patterns) < 2:
-        issues.append("Lacks quantified achievements — add metrics (e.g., 'reduced latency by 35%', 'served 10K users')")
+    if verb_count == 0:
+        issues.append(
+            "No strong action verbs found — ATS and recruiters expect bullet points "
+            "starting with verbs like 'Engineered', 'Led', 'Optimized'"
+        )
         deductions += 8
-    else:
-        passes.append(f"Quantified achievements found ({len(quant_patterns)} metrics detected)")
-
-    # ── 6. ATS Red Flags (10 pts) ───────────────────────────────────────
-    # Check for table-like patterns (multiple tab/pipe chars)
-    if text and text.count('\t') > 10:
-        issues.append("Possible table/column layout detected — ATS often misreads multi-column resumes")
+    elif verb_count < 3:
+        issues.append(
+            f"Weak action verb usage ({verb_count} found) — "
+            "aim for 5+ distinct strong verbs across experience bullet points"
+        )
         deductions += 5
+    elif verb_count < 5:
+        issues.append(
+            f"Limited action verb variety ({verb_count} found) — "
+            "diversify verbs to better demonstrate range of contributions"
+        )
+        deductions += 2
     else:
-        passes.append("No table/column layout issues detected")
+        passes.append(f"Strong action verb usage ({verb_count} distinct verbs detected)")
 
-    # Check for objective vs summary (objective is outdated)
-    if "objective" in text_lower and "summary" not in text_lower:
-        issues.append("Uses 'Objective' section — replace with a modern 'Professional Summary'")
+    # ══════════════════════════════════════════════════════════════════════
+    # 5. QUANTIFIED ACHIEVEMENTS  (max −8 pts)
+    #    Broader pattern set captures $, %, x, K, M, large numbers, etc.
+    # ══════════════════════════════════════════════════════════════════════
+    quant_patterns = []
+
+    # Percentage metrics: 35%, 2.5 percent
+    quant_patterns += re.findall(
+        r'\b\d+[\.,]?\d*\s*(%|percent)\b', text_lower
+    )
+    # Multiplier / scale: 10x, 3 times
+    quant_patterns += re.findall(
+        r'\b\d+[\.,]?\d*\s*(x|times)\b', text_lower
+    )
+    # Counts with units: 10K users, 500 clients, 3 projects, 50 hours
+    quant_patterns += re.findall(
+        r'\b\d+[,.]?\d*\s*(k|m)?\s*(users|clients|customers|projects|tickets|'
+        r'requests|transactions|queries|hrs|hours|days|weeks|months|years|'
+        r'engineers|developers|members|students|candidates|submissions)\b',
+        text_lower
+    )
+    # Technical metrics: 200ms, 50GB, 1TB
+    quant_patterns += re.findall(
+        r'\b\d+[\.,]?\d*\s*(ms|gb|tb|mb|rpm|rps|qps|wpm|tps)\b', text_lower
+    )
+    # Dollar amounts: $50K, $1.2M, $500
+    quant_patterns += re.findall(
+        r'\$\s*\d+[\d,.]*\s*[kKmMbB]?\b', text_lower
+    )
+    # Large bare numbers (10,000+) — likely meaningful scale references
+    quant_patterns += re.findall(
+        r'\b\d{1,3}[,]\d{3}\b', text_lower
+    )
+    # Qualitative scale indicators
+    quant_patterns += re.findall(
+        r'\b(doubled|tripled|halved|10x|100x)\b', text_lower
+    )
+    # "3+ years" style
+    quant_patterns += re.findall(
+        r'\b\d+\+\s*(years|yrs|months)\b', text_lower
+    )
+
+    metric_count = len(quant_patterns)
+    if metric_count == 0:
+        issues.append(
+            "No quantified achievements detected — add measurable impact "
+            "(e.g., 'reduced latency by 35%', 'served 10K users', 'saved $50K annually')"
+        )
+        deductions += 8
+    elif metric_count < 3:
+        issues.append(
+            f"Few quantified achievements ({metric_count} found) — "
+            "aim for 4+ metrics across your experience to demonstrate concrete impact"
+        )
+        deductions += 4
+    else:
+        passes.append(f"Quantified achievements present ({metric_count} metrics detected)")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 6. ATS RED FLAGS  (max −14 pts)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # 6a. Multi-column layout detection
+    #     Priority: use real PDF block coordinates if pdf_path available,
+    #     fall back to tab-character heuristic for plain-text paths.
+    multicolumn_detected = False
+    if pdf_path:
+        try:
+            multicolumn_detected = _detect_multicolumn_pdf(pdf_path)
+        except Exception:
+            multicolumn_detected = False
+    if not multicolumn_detected and text:
+        # Fallback heuristic: heavy tab usage OR many pipe characters
+        multicolumn_detected = (
+            text.count('\t') > 8 or
+            text.count('|') > 12
+        )
+
+    if multicolumn_detected:
+        issues.append(
+            "Multi-column or table layout detected — "
+            "many ATS parsers read columns out of order, scrambling your resume content; "
+            "use a single-column layout"
+        )
+        deductions += 7
+    else:
+        passes.append("Single-column layout detected — ATS-safe structure")
+
+    # 6b. Outdated 'Objective' section
+    if "objective" in text_lower and "summary" not in text_lower and "professional summary" not in text_lower:
+        issues.append(
+            "Uses 'Objective' section — this is outdated; "
+            "replace with a modern 'Professional Summary' (2–3 targeted sentences)"
+        )
         deductions += 3
-    
-    # Check for date formats
+
+    # 6c. Employment dates
     has_dates = bool(re.search(r'\b(19|20)\d{2}\b', text or ""))
     if not has_dates:
-        issues.append("No dates detected — ATS expects employment dates for timeline parsing")
+        issues.append(
+            "No employment dates detected — "
+            "ATS requires dates to build a timeline; "
+            "add month/year ranges (e.g., 'Jan 2021 – Mar 2023')"
+        )
         deductions += 5
     else:
-        passes.append("Employment dates detected")
+        passes.append("Employment dates detected — ATS can parse your timeline")
 
-    # ── Final Score ──────────────────────────────────────────────────────
-    raw_score = max(0, 100 - deductions)
+    # 6d. Special characters / encoding issues that confuse ATS parsers
+    if text:
+        special_char_count = len(re.findall(r'[^\x00-\x7F]', text))
+        ratio = special_char_count / max(len(text), 1)
+        if ratio > 0.04:
+            issues.append(
+                f"High non-ASCII character density ({special_char_count} chars) — "
+                "special characters from stylised fonts or copy-paste can corrupt ATS parsing"
+            )
+            deductions += 3
+        else:
+            passes.append("Character encoding looks ATS-safe (low non-ASCII density)")
+
+    # 6e. Excessive repetition of buzzwords (keyword stuffing signal)
+    buzzwords = ["synergy", "passionate", "hardworking", "go-getter", "think outside the box",
+                 "detail-oriented", "team player", "results-driven", "dynamic", "proactive"]
+    stuffed = [bw for bw in buzzwords if text_lower.count(bw) >= 2]
+    if len(stuffed) >= 2:
+        issues.append(
+            f"Possible keyword stuffing detected ({', '.join(stuffed)}) — "
+            "overused buzzwords reduce credibility; replace with concrete examples"
+        )
+        deductions += 2
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 7. BONUS CREDITS  (up to +4 pts)
+    #    Reward genuine ATS positive signals.
+    # ══════════════════════════════════════════════════════════════════════
+
+    # Certifications section
+    if any(w in text_lower for w in [
+        "certification", "certified", "certificate", "aws certified",
+        "google certified", "microsoft certified", "pmp", "cpa",
+        "cissp", "ceh", "comptia", "coursera", "udemy", "edx",
+    ]):
+        passes.append("Certifications / credentials detected — strong ATS positive signal")
+        bonuses += 1
+
+    # Projects section
+    if any(w in text_lower for w in [
+        "projects", "personal projects", "side projects",
+        "open source", "github.com", "hackathon",
+    ]):
+        passes.append("Projects section detected — demonstrates initiative beyond job roles")
+        bonuses += 1
+
+    # Consistent date format (month year)
+    month_year_dates = re.findall(
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(19|20)\d{2}\b',
+        text_lower
+    )
+    if len(month_year_dates) >= 2:
+        passes.append("Consistent Month-Year date format detected — preferred by ATS parsers")
+        bonuses += 1
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 8. FINAL SCORE CALCULATION
+    # ══════════════════════════════════════════════════════════════════════
+    raw_score = max(0, min(100, 100 - deductions + bonuses))
 
     if raw_score >= 90:
         letter_grade = "A+"
@@ -2894,12 +3176,18 @@ def check_resume_format(text: str, num_pages: int = 1) -> dict:
         label = "Poor — Major Issues"
 
     return {
-        "format_score": raw_score,
-        "letter_grade": letter_grade,
-        "label": label,
-        "issues": issues,
-        "passes": passes,
-        "word_count": word_count,
+        "format_score":  raw_score,
+        "letter_grade":  letter_grade,
+        "label":         label,
+        "issues":        issues,
+        "passes":        passes,
+        "word_count":    word_count,
+        # Extended breakdown (available to callers that want sub-scores)
+        "deductions":    deductions,
+        "bonuses":       bonuses,
+        "verb_count":    verb_count,
+        "metric_count":  metric_count,
+        "multicolumn":   multicolumn_detected,
     }
 
 # Detect bias in resume
@@ -3455,7 +3743,7 @@ Suggestions:
     feedback_match = re.search(r"Feedback:\s*(.+)", response)
     suggestions = re.findall(r"- (.+)", response)
 
-    score = int(score_match.group(1)) if score_match else max(0, min(max_score, max(3, max_score-2)))  # More generous default, clamped to max_score
+    score = int(score_match.group(1)) if score_match else max(0, min(max_score, max(3, max_score - 2)))  # Generous default, clamped to max_score
     feedback = feedback_match.group(1).strip() if feedback_match else "Language quality appears adequate for professional communication."
     return score, feedback, suggestions
 
@@ -3796,7 +4084,7 @@ Follow this EXACT structure. Do not skip any section:
     # Extract missing items with better parsing - now called "opportunities"
     missing_keywords_section = extract_section(r"\*\*Keyword Enhancement Opportunities:\*\*(.*?)(?:\*\*|###|\Z)", keyword_analysis)
     missing_skills_section = extract_section(r"\*\*Skills Gaps \(Development Opportunities\):\*\*(.*?)(?:\*\*|###|\Z)", skills_analysis)
-    
+
     # Fallback to old patterns if new ones don't match
     if not missing_keywords_section.strip():
         missing_keywords_section = extract_section(r"\*\*Missing Critical Keywords:\*\*(.*?)(?:\*\*|###|\Z)", keyword_analysis)
@@ -3836,25 +4124,25 @@ Follow this EXACT structure. Do not skip any section:
     # Step 1: sum the five LLM-scored components (clamped to their individual weights)
     content_score = edu_score + exp_score + skills_score + lang_score + keyword_score
 
-    # Normalise to 100-pt scale in case sidebar weights don't sum exactly to 100
+    # Normalise LLM components to 90-pt scale (format takes the remaining 10 pts)
+    # This keeps total = 100 while giving format meaningful, visible weight.
     weight_total = edu_weight + exp_weight + skills_weight + lang_weight + keyword_weight
-    if weight_total > 0 and weight_total != 100:
-        content_score = round(content_score / weight_total * 100)
-    content_score = max(0, min(100, content_score))
+    if weight_total > 0:
+        content_score = round(content_score / weight_total * 90)
+    content_score = max(0, min(90, content_score))
 
-    # Step 2: format score (0–100) contributes a fixed 5-pt bonus/penalty
-    # normalised to ±5 around a neutral midpoint of 75
+    # Step 2: format score (0–100) contributes a fixed 10-pt component
+    # Scaled proportionally: 100 format → 10 pts, 0 format → 0 pts
     fmt_score_raw = format_data.get("format_score", 75) if format_data else 75
-    fmt_score_raw = max(0, min(100, int(fmt_score_raw)))   # clamp to 0–100
-    # delta: +5 if perfect format (100), 0 at 75, −5 if terrible format (25 or below)
-    format_delta = round((fmt_score_raw - 75) / 25 * 5)   # range: −10 … +5
-    format_delta = max(-10, min(5, format_delta))          # hard clamp
+    fmt_score_raw = max(0, min(100, int(fmt_score_raw)))
+    FORMAT_WEIGHT = 10
+    format_component = round(fmt_score_raw / 100 * FORMAT_WEIGHT)
 
-    # Step 3: add format delta to content score — this is the pre-penalty total
-    pre_penalty_score = content_score + format_delta
+    # Step 3: combine content + format → pre-penalty total (0–100)
+    pre_penalty_score = content_score + format_component
     pre_penalty_score = max(0, min(100, pre_penalty_score))
 
-    # Step 4: subtract domain mismatch penalty ONCE, straight subtraction — no floor tricks
+    # Step 4: subtract domain mismatch penalty ONCE — straight subtraction
     total_score = pre_penalty_score - domain_penalty
 
     # Step 5: clamp final result 15–100
@@ -3885,8 +4173,8 @@ Follow this EXACT structure. Do not skip any section:
     final_thoughts += f"""
 
 **Technical Evaluation Details:**
-- Content Score (pre-format): {content_score}/100
-- Format Delta Applied: {'+' if format_delta >= 0 else ''}{format_delta} pts (Format Score: {fmt_score_raw}/100)
+- Content Score (LLM components, 90-pt scale): {content_score}/90
+- Format Component (10-pt scale): {format_component}/10 (Format Score: {fmt_score_raw}/100)
 - Pre-Penalty Score: {pre_penalty_score}/100
 - Domain Penalty Applied: -{domain_penalty} pts (out of max -{MAX_DOMAIN_PENALTY} pts)
 - Final ATS Score: {total_score}/100
@@ -3904,9 +4192,10 @@ Follow this EXACT structure. Do not skip any section:
 - 0–24: Major misalignment — Not suitable for this specific role
 
 **ATS Scoring Notes:**
-- Minimum score thresholds applied to prevent unfair penalization
-- Format score contributes a ±5 to ±10 pt delta (neutral at 75/100)
-- Domain penalty is subtracted once as a flat deduction
+- Scoring model: LLM components (90 pts) + Format (10 pts) − Domain penalty
+- Format score is a real 10-pt component (not a delta) — poor formatting meaningfully lowers the score
+- Domain penalty subtracted once as a flat deduction (max {MAX_DOMAIN_PENALTY} pts)
+- Format checker v2: uses PDF block-coordinate multi-column detection, tiered deductions, bonus credits
 - Transferable skills, projects, and open-source contributions were credited
 - Career stage (entry/mid/senior) considered in experience scoring
 """
@@ -4007,16 +4296,22 @@ with st.sidebar.expander("![Job](https://img.icons8.com/ios-filled/20/briefcase.
 
 # ---------------- Advanced Weights Dropdown ----------------
 with st.sidebar.expander("![Settings](https://img.icons8.com/ios-filled/20/settings.png) Customize ATS Scoring Weights", expanded=False):
+    st.markdown(
+        "<div style='font-size:0.72rem;color:#64748b;margin-bottom:8px;font-family:-apple-system,sans-serif;'>"
+        "Format quality is scored automatically (10 pts fixed). "
+        "Adjust the remaining <b>90 pts</b> below.</div>",
+        unsafe_allow_html=True
+    )
     edu_weight = st.slider("![Education](https://img.icons8.com/ios-filled/20/graduation-cap.png) Education Weight", 0, 50, 20)
     exp_weight = st.slider("![Experience](https://img.icons8.com/ios-filled/20/portfolio.png) Experience Weight", 0, 50, 35)
-    skills_weight = st.slider("![Skills](https://img.icons8.com/ios-filled/20/gear.png) Skills Match Weight", 0, 50, 30)
+    skills_weight = st.slider("![Skills](https://img.icons8.com/ios-filled/20/gear.png) Skills Match Weight", 0, 50, 20)
     lang_weight = st.slider("![Language](https://img.icons8.com/ios-filled/20/language.png) Language Quality Weight", 0, 10, 5)
     keyword_weight = st.slider("![Keyword](https://img.icons8.com/ios-filled/20/key.png) Keyword Match Weight", 0, 20, 10)
 
     total_weight = edu_weight + exp_weight + skills_weight + lang_weight + keyword_weight
 
     # ---------------- Inline SVG Validation ----------------
-    if total_weight != 100:
+    if total_weight != 90:
         st.markdown(
             f"""
             <div style="display:flex;align-items:center;gap:8px;
@@ -4033,7 +4328,7 @@ with st.sidebar.expander("![Settings](https://img.icons8.com/ios-filled/20/setti
                              12 17zm1-4V7h-2v6h2z"/>
                 </svg>
                 <span style="color:#fca5a5;font-weight:600;font-size:0.8rem;font-family:-apple-system,sans-serif;">
-                    Total = {total_weight}. Adjust to exactly 100.
+                    Total = {total_weight}. Adjust to exactly 90 (Format = 10 pts fixed).
                 </span>
             </div>
             """,
@@ -4053,7 +4348,7 @@ with st.sidebar.expander("![Settings](https://img.icons8.com/ios-filled/20/setti
                              19 20.3 7.7l-1.4-1.4z"/>
                 </svg>
                 <span style="color:#6ee7b7;font-weight:600;font-size:0.8rem;font-family:-apple-system,sans-serif;">
-                    Weights balanced · Total = 100
+                    Weights balanced · Content = 90 pts · Format = 10 pts · Total = 100
                 </span>
             </div>
             """,
@@ -4318,7 +4613,7 @@ if uploaded_files and job_description:
             doc_check.close()
         except Exception:
             num_pages = 1
-        format_data = check_resume_format(full_text, num_pages)
+        format_data = check_resume_format(full_text, num_pages, pdf_path=file_path)
 
         # ✅ LLM-based ATS Evaluation
         ats_result, ats_scores = ats_percentage_score(
@@ -7222,6 +7517,7 @@ with tab2:
     st.session_state.setdefault("project_entries", [{"title": "", "tech": "", "duration": "", "description": ""}])
     st.session_state.setdefault("project_links", [])
     st.session_state.setdefault("certificate_links", [{"name": "", "link": "", "duration": "", "description": ""}])
+    st.session_state.setdefault("form_key_counter", 0)
 
     # ---------------- Sidebar (ONLY in Tab 2) ----------------
     with st.sidebar:
@@ -7274,232 +7570,215 @@ with tab2:
                 elif mode == "Delete" and len(st.session_state.certificate_links) > 1:
                     st.session_state.certificate_links.pop()
 
-    # ---------------- Resume Form (NO st.form — direct widget keys for zero-lag) ----------------
-    # Split into form column + live preview column (reference-app pattern)
-    form_col, preview_col = st.columns([3, 2], gap="large")
-
-    with form_col:
-        st.markdown("### 👤 Personal Information")
+    # ---------------- Resume Form ----------------
+    fk = st.session_state["form_key_counter"]
+    with st.form(f"resume_form_{fk}", clear_on_submit=False):
+        st.markdown("### 👤 <u>Personal Information</u>", unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
-            st.text_input("👤 Full Name", key="name", placeholder="John Doe")
-            st.text_input("📞 Phone Number", key="phone", placeholder="+1 555 123 4567")
-            st.text_input("📍 Location", key="location", placeholder="New York, USA")
+            st.session_state.name = st.text_input("👤 Full Name", value=st.session_state.name, key=f"name_input_{fk}")
+            st.session_state.phone = st.text_input("📞 Phone Number", value=st.session_state.phone, key=f"phone_input_{fk}")
+            st.session_state.location = st.text_input("📍 Location", value=st.session_state.location, key=f"loc_input_{fk}")
         with col2:
-            st.text_input("📧 Email", key="email", placeholder="john@example.com")
-            st.text_input("🔗 LinkedIn", key="linkedin", placeholder="linkedin.com/in/yourname")
-            st.text_input("🌐 Portfolio", key="portfolio", placeholder="yourportfolio.com")
-            st.text_input("💼 Job Title", key="job_title", placeholder="Full Stack Developer")
+            st.session_state.email = st.text_input("📧 Email", value=st.session_state.email, key=f"email_input_{fk}")
+            st.session_state.linkedin = st.text_input("🔗 LinkedIn", value=st.session_state.linkedin, key=f"ln_input_{fk}")
+            st.session_state.portfolio = st.text_input("🌐 Portfolio", value=st.session_state.portfolio, key=f"port_input_{fk}")
+            st.session_state.job_title = st.text_input("💼 Job Title", value=st.session_state.job_title, key=f"job_input_{fk}")
 
-        st.markdown("### 📝 Professional Summary")
-        st.text_area("Summary", key="summary", height=100, label_visibility="collapsed", placeholder="Your professional overview...")
+        st.markdown("### 📝 <u>Professional Summary</u>", unsafe_allow_html=True)
+        st.session_state.summary = st.text_area("Summary", value=st.session_state.summary, key=f"summary_input_{fk}")
 
-        st.markdown("### 💼 Skills, Languages, Interests & Soft Skills")
-        st.text_area("Skills (comma-separated)", key="skills", height=68, placeholder="Python, React, SQL...")
-        st.text_area("Languages (comma-separated)", key="languages", height=68, placeholder="English, Hindi...")
-        st.text_area("Interests (comma-separated)", key="interests", height=68, placeholder="Open Source, AI Research...")
-        st.text_area("Soft Skills (comma-separated)", key="Softskills", height=68, placeholder="Leadership, Communication...")
+        st.markdown("### 💼 <u>Skills, Languages, Interests & Soft Skills</u>", unsafe_allow_html=True)
+        st.session_state.skills = st.text_area("Skills (comma-separated)", value=st.session_state.skills, key=f"skills_input_{fk}")
+        st.session_state.languages = st.text_area("Languages (comma-separated)", value=st.session_state.languages, key=f"lang_input_{fk}")
+        st.session_state.interests = st.text_area("Interests (comma-separated)", value=st.session_state.interests, key=f"int_input_{fk}")
+        st.session_state.Softskills = st.text_area("Softskills (comma-separated)", value=st.session_state.Softskills, key=f"soft_input_{fk}")
 
-        st.markdown("### 🧱 Work Experience")
+        st.markdown("### 🧱 <u>Work Experience</u>", unsafe_allow_html=True)
         for idx, exp in enumerate(st.session_state.experience_entries):
             with st.expander(f"Experience #{idx+1}", expanded=True):
-                exp["title"]       = st.text_input("Job Title",    value=exp.get("title", ""),       key=f"exp_title_{idx}")
-                exp["company"]     = st.text_input("Company",      value=exp.get("company", ""),     key=f"exp_company_{idx}")
-                exp["duration"]    = st.text_input("Duration",     value=exp.get("duration", ""),    key=f"exp_duration_{idx}")
-                exp["description"] = st.text_area("Description",   value=exp.get("description", ""), key=f"exp_desc_{idx}", height=80)
+                exp["title"] = st.text_input("Job Title", value=exp.get("title", ""), key=f"title_{idx}_{len(st.session_state.experience_entries)}_{fk}")
+                exp["company"] = st.text_input("Company", value=exp.get("company", ""), key=f"company_{idx}_{len(st.session_state.experience_entries)}_{fk}")
+                exp["duration"] = st.text_input("Duration", value=exp.get("duration", ""), key=f"duration_{idx}_{len(st.session_state.experience_entries)}_{fk}")
+                exp["description"] = st.text_area("Description", value=exp.get("description", ""), key=f"description_{idx}_{len(st.session_state.experience_entries)}_{fk}")
 
-        st.markdown("### 🎓 Education")
+        st.markdown("### 🎓 <u>Education</u>", unsafe_allow_html=True)
         for idx, edu in enumerate(st.session_state.education_entries):
             with st.expander(f"Education #{idx+1}", expanded=True):
-                edu["degree"]      = st.text_input("Degree",      value=edu.get("degree", ""),      key=f"edu_degree_{idx}")
-                edu["institution"] = st.text_input("Institution", value=edu.get("institution", ""), key=f"edu_inst_{idx}")
-                edu["year"]        = st.text_input("Year",        value=edu.get("year", ""),        key=f"edu_year_{idx}")
-                edu["details"]     = st.text_area("Details",      value=edu.get("details", ""),     key=f"edu_details_{idx}", height=68)
+                edu["degree"] = st.text_input("Degree", value=edu.get("degree", ""), key=f"degree_{idx}_{len(st.session_state.education_entries)}_{fk}")
+                edu["institution"] = st.text_input("Institution", value=edu.get("institution", ""), key=f"institution_{idx}_{len(st.session_state.education_entries)}_{fk}")
+                edu["year"] = st.text_input("Year", value=edu.get("year", ""), key=f"edu_year_{idx}_{len(st.session_state.education_entries)}_{fk}")
+                edu["details"] = st.text_area("Details", value=edu.get("details", ""), key=f"edu_details_{idx}_{len(st.session_state.education_entries)}_{fk}")
 
-        st.markdown("### 🛠 Projects")
+        st.markdown("### 🛠 <u>Projects</u>", unsafe_allow_html=True)
         for idx, proj in enumerate(st.session_state.project_entries):
             with st.expander(f"Project #{idx+1}", expanded=True):
-                proj["title"]       = st.text_input("Project Title", value=proj.get("title", ""),       key=f"proj_title_{idx}")
-                proj["tech"]        = st.text_input("Tech Stack",    value=proj.get("tech", ""),        key=f"proj_tech_{idx}")
-                proj["duration"]    = st.text_input("Duration",      value=proj.get("duration", ""),    key=f"proj_duration_{idx}")
-                proj["description"] = st.text_area("Description",    value=proj.get("description", ""), key=f"proj_desc_{idx}", height=80)
+                proj["title"] = st.text_input("Project Title", value=proj.get("title", ""), key=f"proj_title_{idx}_{len(st.session_state.project_entries)}_{fk}")
+                proj["tech"] = st.text_input("Tech Stack", value=proj.get("tech", ""), key=f"proj_tech_{idx}_{len(st.session_state.project_entries)}_{fk}")
+                proj["duration"] = st.text_input("Duration", value=proj.get("duration", ""), key=f"proj_duration_{idx}_{len(st.session_state.project_entries)}_{fk}")
+                proj["description"] = st.text_area("Description", value=proj.get("description", ""), key=f"proj_desc_{idx}_{len(st.session_state.project_entries)}_{fk}")
 
         st.markdown("### 🔗 Project Links")
-        project_links_input = st.text_area(
-            "One link per line", key="proj_links_text",
-            value="\n".join(st.session_state.project_links), height=80
-        )
-        st.session_state.project_links = [l.strip() for l in project_links_input.splitlines() if l.strip()]
+        project_links_input = st.text_area("Enter one project link per line:", value="\n".join(st.session_state.project_links), key=f"proj_links_input_{fk}")
+        if project_links_input:
+            st.session_state.project_links = [link.strip() for link in project_links_input.splitlines() if link.strip()]
 
-        st.markdown("### 🧾 Certificates")
+        st.markdown("### 🧾 <u>Certificates</u>", unsafe_allow_html=True)
         for idx, cert in enumerate(st.session_state.certificate_links):
             with st.expander(f"Certificate #{idx+1}", expanded=True):
-                cert["name"]        = st.text_input("Certificate Name", value=cert.get("name", ""),        key=f"cert_name_{idx}")
-                cert["link"]        = st.text_input("Certificate Link", value=cert.get("link", ""),        key=f"cert_link_{idx}")
-                cert["duration"]    = st.text_input("Duration",         value=cert.get("duration", ""),    key=f"cert_dur_{idx}")
-                cert["description"] = st.text_area("Description",       value=cert.get("description", ""), key=f"cert_desc_{idx}", height=68)
+                cert["name"] = st.text_input("Certificate Name", value=cert.get("name", ""), key=f"cert_name_{idx}_{len(st.session_state.certificate_links)}_{fk}")
+                cert["link"] = st.text_input("Certificate Link", value=cert.get("link", ""), key=f"cert_link_{idx}_{len(st.session_state.certificate_links)}_{fk}")
+                cert["duration"] = st.text_input("Duration", value=cert.get("duration", ""), key=f"cert_duration_{idx}_{len(st.session_state.certificate_links)}_{fk}")
+                cert["description"] = st.text_area("Description", value=cert.get("description", ""), key=f"cert_description_{idx}_{len(st.session_state.certificate_links)}_{fk}")
 
-        # ── Action buttons (plain st.button — no st.form needed) ──────────
-        btn_col1, btn_col2 = st.columns(2)
+        btn_col1, btn_col2 = st.columns([1, 1])
         with btn_col1:
-            submitted = st.button("📑 Generate Resume", use_container_width=True)
+            submitted = st.form_submit_button("📑 Generate Resume", use_container_width=True)
         with btn_col2:
-            clear_clicked = st.button("🗑️ Clear Form", use_container_width=True)
+            clear_clicked = st.form_submit_button("🗑️ Clear Form", use_container_width=True)
 
         if submitted:
             st.session_state["_resume_generated_msg"] = True
 
         if clear_clicked:
+            # Reset only resume-related keys — do NOT clear() or rerun() as that
+            # wipes tab context and navigates back to the main/home page.
+            # Instead, reset values in-place and bump the form key counter so
+            # all widgets re-render empty on this same run, no page jump.
+            _new_counter = st.session_state.get("form_key_counter", 0) + 1
             resume_fields = ["name", "email", "phone", "linkedin", "location",
                              "portfolio", "summary", "skills", "languages",
                              "interests", "Softskills", "job_title"]
             for _f in resume_fields:
                 st.session_state[_f] = ""
-            st.session_state["experience_entries"]  = [{"title": "", "company": "", "duration": "", "description": ""}]
-            st.session_state["education_entries"]   = [{"degree": "", "institution": "", "year": "", "details": ""}]
-            st.session_state["project_entries"]     = [{"title": "", "tech": "", "duration": "", "description": ""}]
-            st.session_state["project_links"]       = []
-            st.session_state["certificate_links"]   = [{"name": "", "link": "", "duration": "", "description": ""}]
-            for _key in ["generated_html", "pdf_resume_bytes", "ai_output",
-                         "cover_letter", "cover_letter_html", "encoded_profile_image",
-                         "proj_links_text"]:
+            st.session_state["experience_entries"] = [{"title": "", "company": "", "duration": "", "description": ""}]
+            st.session_state["education_entries"] = [{"degree": "", "institution": "", "year": "", "details": ""}]
+            st.session_state["project_entries"] = [{"title": "", "tech": "", "duration": "", "description": ""}]
+            st.session_state["project_links"] = []
+            st.session_state["certificate_links"] = [{"name": "", "link": "", "duration": "", "description": ""}]
+            for _key in ["generated_html", "ai_output", "cover_letter",
+                         "cover_letter_html", "encoded_profile_image"]:
                 st.session_state.pop(_key, None)
-            st.rerun()
+            st.session_state["form_key_counter"] = _new_counter
 
-    # ── Live inline preview (right column — updates every rerun automatically) ──
-    with preview_col:
-        ss = st.session_state
-        name_val     = ss.get("name", "")
-        title_val    = ss.get("job_title", "")
-        email_val    = ss.get("email", "")
-        phone_val    = ss.get("phone", "")
-        location_val = ss.get("location", "")
-        linkedin_val = ss.get("linkedin", "")
-        portfolio_val= ss.get("portfolio", "")
-        summary_val  = ss.get("summary", "")
+    st.markdown("""
+    <style>
+        .heading-large {
+            font-size: 36px;
+            font-weight: bold;
+            color: #336699;
+        }
+        .subheading-large {
+            font-size: 30px;
+            font-weight: bold;
+            color: #336699;
+        }
+        .tab-section {
+            margin-top: 20px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
-        contact_parts = " | ".join(filter(None, [email_val, phone_val, location_val]))
-        link_parts = ""
-        if linkedin_val:
-            link_parts += f'LinkedIn: {linkedin_val}<br>'
-        if portfolio_val:
-            link_parts += f'Portfolio: {portfolio_val}'
-
-        # Skills pills
-        def _pills(items_str, color="#1e40af", bg="rgba(59,130,246,0.1)", border="rgba(59,130,246,0.3)"):
-            return "".join(
-                f"<span style='display:inline-block;background:{bg};color:{color};"
-                f"border:1px solid {border};border-radius:20px;padding:4px 14px;"
-                f"margin:3px 4px 3px 0;font-size:12px;font-weight:500;'>{s.strip()}</span>"
-                for s in items_str.split(',') if s.strip()
-            )
-
-        def _sec(title, body):
-            return (f"<div class='rv-section'>"
-                    f"<div class='rv-sec-title'>{title}</div>"
-                    f"{body}</div>")
-
-        exp_html = ""
-        for exp in ss.experience_entries:
-            if exp.get("company") or exp.get("title"):
-                desc = exp.get("description","").replace("\n","<br>")
-                exp_html += (
-                    f"<div class='rv-item'>"
-                    f"<div class='rv-item-hdr'>"
-                    f"<div><span class='rv-bold'>{exp.get('company','')}</span>"
-                    f"<span class='rv-sub'> · {exp.get('title','')}</span></div>"
-                    f"<span class='rv-date'>{exp.get('duration','')}</span></div>"
-                    f"<div class='rv-text'>{desc}</div></div>"
-                )
-
-        edu_html = ""
-        for edu in ss.education_entries:
-            if edu.get("institution") or edu.get("degree"):
-                dv = edu.get("degree","")
-                if isinstance(dv, list): dv = ", ".join(dv)
-                edu_html += (
-                    f"<div class='rv-item'>"
-                    f"<div class='rv-item-hdr'>"
-                    f"<span class='rv-bold'>{edu.get('institution','')}</span>"
-                    f"<span class='rv-date'>{edu.get('year','')}</span></div>"
-                    f"<div class='rv-sub'>{dv}</div>"
-                    f"<div class='rv-text'>{edu.get('details','')}</div></div>"
-                )
-
-        proj_html = ""
-        for proj in ss.project_entries:
-            if proj.get("title"):
-                desc = proj.get("description","").replace("\n","<br>")
-                proj_html += (
-                    f"<div class='rv-item'>"
-                    f"<div class='rv-item-hdr'>"
-                    f"<span class='rv-bold'>{proj.get('title','')}</span>"
-                    f"<span class='rv-date'>{proj.get('duration','')}</span></div>"
-                    f"<div class='rv-sub'>{proj.get('tech','')}</div>"
-                    f"<div class='rv-text'>{desc}</div></div>"
-                )
-
-        cert_html = ""
-        for cert in ss.certificate_links:
-            if cert.get("name"):
-                cert_html += (
-                    f"<div class='rv-item'>"
-                    f"<div class='rv-item-hdr'>"
-                    f"<a href='{cert.get('link','#')}' class='rv-link'>{cert.get('name','')}</a>"
-                    f"<span class='rv-date'>{cert.get('duration','')}</span></div></div>"
-                )
-
-        st.markdown("""
-        <style>
-        .rv-wrap{background:#fff;border-radius:14px;padding:28px 28px 20px;
-            box-shadow:0 4px 24px rgba(0,0,0,0.12);font-family:'Segoe UI',sans-serif;
-            color:#1e293b;min-height:500px;}
-        .rv-name{font-size:22px;font-weight:700;color:#1e293b;margin-bottom:2px;}
-        .rv-title{font-size:13px;color:#3b82f6;font-weight:600;letter-spacing:.5px;
-            text-transform:uppercase;margin-bottom:6px;}
-        .rv-contact{font-size:12px;color:#64748b;margin-bottom:4px;line-height:1.6;}
-        .rv-divider{height:2px;background:linear-gradient(90deg,#3b82f6,transparent);
-            margin:14px 0 10px;}
-        .rv-section{margin-top:14px;}
-        .rv-sec-title{font-size:11px;font-weight:700;text-transform:uppercase;
-            letter-spacing:1.5px;color:#1e293b;border-bottom:1.5px solid #3b82f6;
-            padding-bottom:4px;margin-bottom:8px;}
-        .rv-item{margin-bottom:10px;}
-        .rv-item-hdr{display:flex;justify-content:space-between;align-items:baseline;
-            flex-wrap:wrap;gap:4px;margin-bottom:2px;}
-        .rv-bold{font-size:13px;font-weight:600;color:#1e293b;}
-        .rv-sub{font-size:12px;color:#3b82f6;font-weight:500;}
-        .rv-date{font-size:11px;color:#94a3b8;white-space:nowrap;}
-        .rv-text{font-size:12px;color:#475569;line-height:1.6;margin-top:3px;}
-        .rv-link{color:#3b82f6;font-size:13px;font-weight:600;text-decoration:none;}
-        .rv-pills{margin-top:4px;}
-        </style>
-        """, unsafe_allow_html=True)
-
-        preview_body = f"""
-        <div class='rv-wrap'>
-          {'<div class="rv-name">' + name_val + '</div>' if name_val else ''}
-          {'<div class="rv-title">' + title_val + '</div>' if title_val else ''}
-          <div class='rv-contact'>{contact_parts}</div>
-          {'<div class="rv-contact">' + link_parts + '</div>' if link_parts else ''}
-          <div class='rv-divider'></div>
-          {_sec("Professional Summary", f"<div class='rv-text'>{summary_val.replace(chr(10),'<br>')}</div>") if summary_val else ''}
-          {_sec("Work Experience", exp_html) if exp_html else ''}
-          {_sec("Education", edu_html) if edu_html else ''}
-          {_sec("Projects", proj_html) if proj_html else ''}
-          {_sec("Skills", "<div class='rv-pills'>" + _pills(ss.get('skills','')) + "</div>") if ss.get('skills') else ''}
-          {_sec("Soft Skills", "<div class='rv-pills'>" + _pills(ss.get('Softskills',''),'#7c3aed','rgba(124,58,237,0.1)','rgba(124,58,237,0.3)') + "</div>") if ss.get('Softskills') else ''}
-          {_sec("Languages", "<div class='rv-pills'>" + _pills(ss.get('languages',''),'#059669','rgba(5,150,105,0.1)','rgba(5,150,105,0.3)') + "</div>") if ss.get('languages') else ''}
-          {_sec("Interests", "<div class='rv-pills'>" + _pills(ss.get('interests',''),'#d97706','rgba(217,119,6,0.1)','rgba(217,119,6,0.3)') + "</div>") if ss.get('interests') else ''}
-          {_sec("Certifications", cert_html) if cert_html else ''}
-        </div>
-        """
-        st.markdown(preview_body, unsafe_allow_html=True)
-
-    # ── Success toast (shown once after Generate Resume is clicked) ──────────
+    # --- Visual Resume Preview Section (only shown after form is submitted) ---
     if st.session_state.get("_resume_generated_msg"):
-        st.success("✅ Resume Generated! Scroll down to download or preview.")
-        st.session_state["_resume_generated_msg"] = False
+        st.success("✅ Resume Generated Successfully! Scroll down to preview or download.")
+        st.session_state["_resume_generated_msg"] = False  # show only once per submit
+
+    if "generated_html" in st.session_state:
+        st.markdown("## 🧾 <span style='color:#336699;'>Resume Preview</span>", unsafe_allow_html=True)
+        st.markdown("<hr style='border-top: 2px solid #bbb;'>", unsafe_allow_html=True)
+
+        left, right = st.columns([1, 2])
+
+        with left:
+            st.markdown(f"""
+                <h2 style='color:#2f2f2f;margin-bottom:0;'>{st.session_state['name']}</h2>
+                <h4 style='margin-top:5px;color:#444;'>{st.session_state['job_title']}</h4>
+                <p style='font-size:14px;'>
+                📍 {st.session_state['location']}<br>
+                📞 {st.session_state['phone']}<br>
+                📧 <a href="mailto:{st.session_state['email']}">{st.session_state['email']}</a><br>
+                🔗 <a href="{st.session_state['linkedin']}" target="_blank">LinkedIn</a><br>
+                🌐 <a href="{st.session_state['portfolio']}" target="_blank">Portfolio</a>
+                </p>
+            """, unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Skills</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for skill in [s.strip() for s in st.session_state["skills"].split(",") if s.strip()]:
+                st.markdown(f"<div style='margin-left:10px;'>• {skill}</div>", unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Languages</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for lang in [l.strip() for l in st.session_state["languages"].split(",") if l.strip()]:
+                st.markdown(f"<div style='margin-left:10px;'>• {lang}</div>", unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Interests</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for interest in [i.strip() for i in st.session_state["interests"].split(",") if i.strip()]:
+                st.markdown(f"<div style='margin-left:10px;'>• {interest}</div>", unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Softskills</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for ss in [i.strip() for i in st.session_state["Softskills"].split(",") if i.strip()]:
+                st.markdown(f"<div style='margin-left:10px;'>• {ss}</div>", unsafe_allow_html=True)
+
+        with right:
+            st.markdown("<h4 style='color:#336699;'>Summary</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            summary_text = st.session_state["summary"].replace("\n", "<br>")
+            st.markdown(f"<p style='font-size:17px;'>{summary_text}</p>", unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Experience</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for exp in st.session_state.experience_entries:
+                if exp["company"] or exp["title"]:
+                    st.markdown(f"""
+                    <div style='margin-bottom:15px; padding:10px; border-radius:8px;'>
+                        <div style='display:flex; justify-content:space-between;'>
+                            <b>🏢 {exp['company']}</b><span style='color:gray;'>📆 {exp['duration']}</span>
+                        </div>
+                        <div style='font-size:14px;'>💼 <i>{exp['title']}</i></div>
+                        <div style='font-size:17px;'>📝 {exp['description']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>🎓 Education</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for edu in st.session_state.education_entries:
+                if edu["institution"] or edu["degree"]:
+                    st.markdown(f"""
+                    <div style='margin-bottom:15px; padding:10px 15px; border-radius:8px;'>
+                        <div style='display:flex; justify-content:space-between; font-size:16px; font-weight:bold;'>
+                            <span>🏫 {edu['institution']}</span>
+                            <span style='color:gray;'>📅 {edu['year']}</span>
+                        </div>
+                        <div style='font-size:14px;'>🎓 <i>{edu['degree']}</i></div>
+                        <div style='font-size:14px;'>📄 {edu['details']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("<h4 style='color:#336699;'>Projects</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+            for proj in st.session_state.project_entries:
+                if proj.get("title"):
+                    st.markdown(f"""
+                    <div style='margin-bottom:15px; padding:10px;'>
+                        <strong style='font-size:16px;'>{proj['title']}</strong><br>
+                        <span style='font-size:14px;'>🛠️ <strong>Tech Stack:</strong> {proj['tech']}</span><br>
+                        <span style='font-size:14px;'>⏳ <strong>Duration:</strong> {proj['duration']}</span><br>
+                        <span style='font-size:17px;'>📝 <strong>Description:</strong> {proj['description']}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            if st.session_state.project_links:
+                st.markdown("<h4 style='color:#336699;'>Project Links</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+                for i, link in enumerate(st.session_state.project_links):
+                    st.markdown(f"[🔗 Project {i+1}]({link})", unsafe_allow_html=True)
+
+            if st.session_state.certificate_links:
+                st.markdown("<h4 style='color:#336699;'>Certificates</h4><hr style='margin-top:-10px;'>", unsafe_allow_html=True)
+                for cert in st.session_state.certificate_links:
+                    if cert["name"] and cert["link"]:
+                        st.markdown(f"""
+                        <div style='display:flex; justify-content:space-between;'>
+                            <a href="{cert['link']}" target="_blank"><b>📄 {cert['name']}</b></a>
+                            <span style='color:gray;'>{cert['duration']}</span>
+                        </div>
+                        <div style='margin-bottom:10px; font-size:14px;'>{cert['description']}</div>
+                        """, unsafe_allow_html=True)
 
 import re
 
