@@ -4704,7 +4704,8 @@ if uploaded_files and job_description:
                 skills_score,
                 lang_score,
                 keyword_score,
-                bias_score
+                bias_score,
+                fmt_score,   # ← format_score now saved to DB
             ),
             job_title=job_title,
             job_description=job_description
@@ -18120,6 +18121,7 @@ if tab5:
 					'skills_score': '{:.0f}',
 					'lang_score': '{:.0f}',
 					'keyword_score': '{:.0f}',
+					'format_score': '{:.0f}',
 					'bias_score': '{:.3f}'
 				}),
 				use_container_width=True,
@@ -18579,8 +18581,9 @@ if tab5:
 					st.markdown("#### Comprehensive Domain Performance Metrics")
 					
 					# Performance heatmap
-					performance_cols = ['avg_ats_score', 'avg_edu_score', 'avg_exp_score', 
-								'avg_skills_score', 'avg_lang_score', 'avg_keyword_score']
+					performance_cols = ['avg_ats_score', 'avg_edu_score', 'avg_exp_score',
+								'avg_skills_score', 'avg_lang_score', 'avg_keyword_score',
+								'avg_format_score']
 					
 					if all(col in df_performance.columns for col in performance_cols):
 						heatmap_data = df_performance[['domain'] + performance_cols].set_index('domain')
@@ -18612,3 +18615,4 @@ if tab5:
 			<p>Last updated: {}</p>
 		</div>
 		""".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")), unsafe_allow_html=True)
+
