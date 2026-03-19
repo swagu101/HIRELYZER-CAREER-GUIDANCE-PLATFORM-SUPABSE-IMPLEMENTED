@@ -11,6 +11,7 @@ import base64
 from io import BytesIO
 from collections import Counter
 from datetime import datetime
+from timezone_helper import now_ist, today_ist, IST
 import time
 
 # Third-party library imports
@@ -190,7 +191,7 @@ def generate_cover_letter_from_resume_builder():
     summary = st.session_state.get("summary", "")
     skills = st.session_state.get("skills", "")
     location = st.session_state.get("location", "")
-    today_date = datetime.today().strftime("%B %d, %Y")
+    today_date = now_ist().strftime("%B %d, %Y")  # FIX: was datetime.today() — now IST-aware
 
     # ✅ Input boxes for contact info
     company = st.text_input("🏢 Target Company", placeholder="e.g., Google")
@@ -1997,8 +1998,11 @@ if not st.session_state.get("authenticated", False):
                 st.markdown(f"<p style='color:#c9d1d9; text-align:center;'>Enter the 6-digit OTP sent to <strong>{st.session_state.pending_registration['email']}</strong></p>", unsafe_allow_html=True)
 
                 # Calculate remaining time
-                from datetime import datetime
-                elapsed = (datetime.now(st.session_state.pending_registration['timestamp'].tzinfo) - st.session_state.pending_registration['timestamp']).total_seconds()
+                # FIX: removed inline `from datetime import datetime` — already imported at top.
+                # FIX: was datetime.now(timestamp.tzinfo) — fragile; relies on session object
+                #      having a tzinfo attribute. Now uses now_ist() directly, which is always
+                #      IST-aware and consistent with how the timestamp was stored in add_user().
+                elapsed = (now_ist() - st.session_state.pending_registration['timestamp']).total_seconds()
                 remaining = max(0, 180 - int(elapsed))
 
                 # Display timer
@@ -2039,7 +2043,9 @@ if not st.session_state.get("authenticated", False):
                             cached_username = st.session_state.pending_registration['username']
 
                             # Re-check expiry before verification
-                            current_elapsed = (datetime.now(st.session_state.pending_registration['timestamp'].tzinfo) - st.session_state.pending_registration['timestamp']).total_seconds()
+                            # FIX: was datetime.now(timestamp.tzinfo) — same fragility as above.
+                            #      now_ist() is always correct and consistent.
+                            current_elapsed = (now_ist() - st.session_state.pending_registration['timestamp']).total_seconds()
                             if current_elapsed >= 180:
                                 notify("register", "error", "⏱️ OTP has expired. Please request a new one.")
                                 st.rerun()
@@ -3768,7 +3774,7 @@ def ats_percentage_score(
     keyword_weight=10,
     format_data=None,   # ← NEW: pass pre-computed format check result
 ):
-    import datetime
+    # FIX: removed `import datetime` inline — now_ist() imported at module level.
 
     # ⚡ MERGED: detect both domains in 1 LLM call (was 2 separate detect_domain_llm calls)
     _valid_domains = [
@@ -3821,9 +3827,10 @@ JOB TEXT (first 600 chars):
         if logic_profile_score else ""
     )
 
-    # ✅ FIXED: Stable education scoring with 2025 cutoff
-    current_year = datetime.datetime.now().year
-    current_month = datetime.datetime.now().month
+    # FIX: was datetime.datetime.now() — naive, no timezone. now_ist() gives IST year/month.
+    _now = now_ist()
+    current_year = _now.year
+    current_month = _now.month
 
     # ✅ UPDATED: Stable education scoring with priority degrees minimum
     prompt = f"""
@@ -4050,7 +4057,7 @@ SCORING SCALE for language ({lang_weight} pts max):
 ---
 
 **EVALUATION CONTEXT:**
-- Current Date: {datetime.datetime.now().strftime('%B %Y')} (Year: {current_year}, Month: {current_month})
+- Current Date: {now_ist().strftime('%B %Y')} (Year: {current_year}, Month: {current_month})  # FIX: was datetime.datetime.now()
 - Resume Domain Detected: {resume_domain}
 - Target Job Domain: {job_domain}
 - Domain Similarity Score: {similarity_score:.2f}/1.0
@@ -18738,6 +18745,7 @@ if tab5:
 		import numpy as np
 		import streamlit as st
 		from datetime import datetime, timedelta
+		from timezone_helper import now_ist, today_ist
 		import plotly.express as px
 		import plotly.graph_objects as go
 		from plotly.subplots import make_subplots
@@ -19048,9 +19056,9 @@ if tab5:
 		st.markdown("#### 📅 Date Range Filter")
 		col1, col2, col3 = st.columns(3)
 		with col1:
-			start_date = st.date_input("📅 Start Date", value=datetime.now() - timedelta(days=30))
+			start_date = st.date_input("📅 Start Date", value=now_ist() - timedelta(days=30))  # FIX: was datetime.now()
 		with col2:
-			end_date = st.date_input("📅 End Date", value=datetime.now())
+			end_date = st.date_input("📅 End Date", value=now_ist())  # FIX: was datetime.now()
 		with col3:
 			if st.button("🎯 Apply Filters", use_container_width=True):
 				try:
@@ -19110,14 +19118,14 @@ if tab5:
 				st.download_button(
 					label="📥 Download Filtered Data (CSV)",
 					data=csv_data,
-					file_name=f"candidates_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+					file_name=f"candidates_filtered_{now_ist().strftime('%Y%m%d_%H%M%S')}.csv",  # FIX: was datetime.now()
 					mime="text/csv",
 					use_container_width=True
 				)
 			with col2:
 				if st.button("📤 Export All Data", use_container_width=True):
 					try:
-						filename = f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+						filename = f"full_export_{now_ist().strftime('%Y%m%d_%H%M%S')}.csv"  # FIX: was datetime.now()
 						if export_to_csv(filename):
 							st.success(f"✅ Data exported to {filename}")
 						else:
@@ -19589,4 +19597,4 @@ if tab5:
 			<p>🛡️ Enhanced Admin Dashboard | Powered by Advanced Database Manager</p>
 			<p>Last updated: {}</p>
 		</div>
-		""".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")), unsafe_allow_html=True)
+		""".format(now_ist().strftime("%Y-%m-%d %H:%M:%S IST")), unsafe_allow_html=True)  # FIX: was datetime.now()
