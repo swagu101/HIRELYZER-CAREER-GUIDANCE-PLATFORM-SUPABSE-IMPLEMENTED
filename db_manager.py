@@ -720,10 +720,10 @@ Agile Coaching, Software Engineering]
     def get_resume_count_by_day(self) -> pd.DataFrame:
         try:
             sql = """
-                SELECT DATE(timestamp) AS day, COUNT(*) AS count
+                SELECT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') AS day, COUNT(*) AS count
                 FROM candidates
-                GROUP BY DATE(timestamp)
-                ORDER BY DATE(timestamp) DESC
+                GROUP BY DATE(timestamp AT TIME ZONE 'Asia/Kolkata')
+                ORDER BY DATE(timestamp AT TIME ZONE 'Asia/Kolkata') DESC
                 LIMIT 365
             """
             return self._read_df(sql)
@@ -768,7 +768,7 @@ Agile Coaching, Software Engineering]
             datetime.strptime(end, '%Y-%m-%d')
             sql = """
                 SELECT * FROM candidates
-                WHERE DATE(timestamp) BETWEEN %s AND %s
+                WHERE DATE(timestamp AT TIME ZONE 'Asia/Kolkata') BETWEEN %s AND %s
                 ORDER BY timestamp DESC
             """
             return self._read_df(sql, params=(start, end))
@@ -830,10 +830,10 @@ Agile Coaching, Software Engineering]
                     sql += " AND domain = %s"
                     params.append(filters['domain'])
                 if 'start_date' in filters:
-                    sql += " AND DATE(timestamp) >= %s"
+                    sql += " AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') >= %s"
                     params.append(filters['start_date'])
                 if 'end_date' in filters:
-                    sql += " AND DATE(timestamp) <= %s"
+                    sql += " AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') <= %s"
                     params.append(filters['end_date'])
             sql += " ORDER BY timestamp DESC"
             df = self._read_df(sql, params=params if params else None)
@@ -872,13 +872,13 @@ Agile Coaching, Software Engineering]
     def get_daily_ats_stats(self, days_limit: int = 90) -> pd.DataFrame:
         try:
             sql = f"""
-                SELECT DATE(timestamp) AS date,
+                SELECT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') AS date,
                        ROUND(AVG(ats_score)::numeric, 2) AS avg_ats,
                        COUNT(*) AS daily_count
                 FROM candidates
-                WHERE DATE(timestamp) >= CURRENT_DATE - INTERVAL '{days_limit} days'
-                GROUP BY DATE(timestamp)
-                ORDER BY DATE(timestamp)
+                WHERE DATE(timestamp AT TIME ZONE 'Asia/Kolkata') >= CURRENT_DATE - INTERVAL '{days_limit} days'
+                GROUP BY DATE(timestamp AT TIME ZONE 'Asia/Kolkata')
+                ORDER BY DATE(timestamp AT TIME ZONE 'Asia/Kolkata')
             """
             return self._read_df(sql)
         except Exception as e:
@@ -964,8 +964,8 @@ Agile Coaching, Software Engineering]
 
                     cur.execute("""
                         SELECT
-                            MIN(DATE(timestamp)) AS earliest_date,
-                            MAX(DATE(timestamp)) AS latest_date
+                            MIN(DATE(timestamp AT TIME ZONE 'Asia/Kolkata')) AS earliest_date,
+                            MAX(DATE(timestamp AT TIME ZONE 'Asia/Kolkata')) AS latest_date
                         FROM candidates
                     """)
                     date_range = cur.fetchone()
@@ -985,7 +985,7 @@ Agile Coaching, Software Engineering]
 
     def cleanup_old_records(self, days_to_keep: int = 365) -> int:
         try:
-            sql = "DELETE FROM candidates WHERE timestamp < NOW() - INTERVAL '1 day' * %s"
+            sql = "DELETE FROM candidates WHERE timestamp < (NOW() AT TIME ZONE 'UTC') - INTERVAL '1 day' * %s"
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, (int(days_to_keep),))
