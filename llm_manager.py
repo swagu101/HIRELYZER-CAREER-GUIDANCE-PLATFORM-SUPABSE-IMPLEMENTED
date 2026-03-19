@@ -400,3 +400,10 @@ def call_llm(
             last_error = e
 
     return f"❌ LLM unavailable: {last_error or 'All healthy keys failed'}"
+
+
+# Auto-create llm_manager tables on import
+try:
+    init_tables()
+except Exception:
+    pass
