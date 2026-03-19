@@ -6,15 +6,20 @@ Migrated from SQLite to Supabase PostgreSQL (psycopg2)
 import psycopg2
 import psycopg2.extras
 import pandas as pd
-from datetime import datetime
-import pytz
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Optional, List, Tuple, Dict, Any
 import logging
 import streamlit as st
-from threading import Lock
 from llm_manager import call_llm
+
+# ── IST timezone (matches llm_manager.py) ────────────────────────────────────
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist() -> datetime:
+    """Current time as a timezone-aware IST datetime."""
+    return datetime.now(IST)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,7 +71,6 @@ class DatabaseManager:
     """
 
     def __init__(self):
-        self._pool_lock = Lock()
         self._initialize_database()
 
     # ── Internal helpers ─────────────────────────────────────────────────────
@@ -129,10 +133,8 @@ class DatabaseManager:
             format_score  INTEGER NOT NULL DEFAULT 0 CHECK (format_score BETWEEN 0 AND 100),
             bias_score    REAL    NOT NULL CHECK (bias_score BETWEEN 0.0 AND 1.0),
             domain        TEXT NOT NULL,
-            timestamp     TIMESTAMP NOT NULL DEFAULT NOW()
+            timestamp     TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        ALTER TABLE candidates ADD COLUMN IF NOT EXISTS
-            format_score INTEGER NOT NULL DEFAULT 0;
         CREATE INDEX IF NOT EXISTS idx_candidates_domain     ON candidates(domain);
         CREATE INDEX IF NOT EXISTS idx_candidates_ats_score  ON candidates(ats_score);
         CREATE INDEX IF NOT EXISTS idx_candidates_timestamp  ON candidates(timestamp);
@@ -646,8 +648,7 @@ Agile Coaching, Software Engineering]
 
     def insert_candidate(self, data: Tuple, job_title: str = "", job_description: str = "") -> int:
         try:
-            local_tz = pytz.timezone("Asia/Kolkata")
-            local_time = datetime.now(local_tz).strftime("%Y-%m-%d %H:%M:%S")
+            local_time      = now_ist()   # IST-aware timestamp — matches llm_manager.py
             detected_domain = self.detect_domain_from_title_and_description(job_title, job_description)
 
             if len(data) < 9:
@@ -984,10 +985,10 @@ Agile Coaching, Software Engineering]
 
     def cleanup_old_records(self, days_to_keep: int = 365) -> int:
         try:
-            sql = f"DELETE FROM candidates WHERE DATE(timestamp) < CURRENT_DATE - INTERVAL '{days_to_keep} days'"
+            sql = "DELETE FROM candidates WHERE timestamp < NOW() - INTERVAL '1 day' * %s"
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(sql)
+                    cur.execute(sql, (int(days_to_keep),))
                     deleted = cur.rowcount
             if deleted > 0:
                 logger.info(f"Cleaned up {deleted} old records")
