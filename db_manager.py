@@ -14,12 +14,11 @@ import logging
 import streamlit as st
 from llm_manager import call_llm
 
-# ── IST timezone (matches llm_manager.py) ────────────────────────────────────
-IST = timezone(timedelta(hours=5, minutes=30))
-
-def now_ist() -> datetime:
-    """Current time as a timezone-aware IST datetime."""
-    return datetime.now(IST)
+# ── Single source of truth for IST timestamps ─────────────────────────────────
+# FIX: Replaced inline IST/now_ist() definition with import from timezone_helper.
+#      All three files (llm_manager, db_manager, user_login) now share the
+#      same IST timezone object — no risk of pytz vs stdlib mismatch.
+from timezone_helper import IST, now_ist, today_ist
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -133,7 +132,8 @@ class DatabaseManager:
             format_score  INTEGER NOT NULL DEFAULT 0 CHECK (format_score BETWEEN 0 AND 100),
             bias_score    REAL    NOT NULL CHECK (bias_score BETWEEN 0.0 AND 1.0),
             domain        TEXT NOT NULL,
-            timestamp     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            -- FIX: No DEFAULT NOW() — Python always supplies an explicit IST timestamp.
+            timestamp     TIMESTAMPTZ NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_candidates_domain     ON candidates(domain);
         CREATE INDEX IF NOT EXISTS idx_candidates_ats_score  ON candidates(ats_score);
@@ -984,11 +984,20 @@ Agile Coaching, Software Engineering]
             return {}
 
     def cleanup_old_records(self, days_to_keep: int = 365) -> int:
+        """
+        FIX: Original used SQL `NOW() AT TIME ZONE 'UTC'` as the cutoff.
+             This is inconsistent — timestamps are stored as IST-aware values,
+             so the cutoff must also be IST-aware to compare correctly.
+             Now uses a Python-generated now_ist() cutoff, matching how all
+             other timestamps in this project are produced.
+        """
+        # FIX: Python-generated IST cutoff — was SQL NOW() AT TIME ZONE 'UTC'
+        cutoff = now_ist() - timedelta(days=int(days_to_keep))
         try:
-            sql = "DELETE FROM candidates WHERE timestamp < (NOW() AT TIME ZONE 'UTC') - INTERVAL '1 day' * %s"
+            sql = "DELETE FROM candidates WHERE timestamp < %s"
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(sql, (int(days_to_keep),))
+                    cur.execute(sql, (cutoff,))
                     deleted = cur.rowcount
             if deleted > 0:
                 logger.info(f"Cleaned up {deleted} old records")
