@@ -6,10 +6,16 @@ import psycopg2.extras
 from datetime import datetime, timedelta, timezone, date
 from langchain_groq import ChatGroq
 
-# ── IST Timezone helpers ──────────────────────────────────────────────────────
-# Supabase stores TIMESTAMPTZ in UTC. All timestamps are written as IST-aware
-# so the Supabase dashboard shows correct IST times, and daily quota resets
-# happen at IST midnight (not UTC midnight = 5:30 AM IST).
+# ---- CONFIG ----
+CACHE_EXPIRY_HOURS       = 24
+FAILURE_COOLDOWN_MINUTES = 5
+QUOTA_COOLDOWN_MINUTES   = 60
+DAILY_KEY_LIMIT          = 800
+DEAD_KEY_REMOVE_DAYS     = 3
+
+# ── IST timezone (UTC+5:30) ───────────────────────────────────────────────────
+# All timestamps written in IST so Supabase dashboard shows correct local time.
+# Quota resets at midnight IST (not 5:30 AM IST which UTC midnight would give).
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def now_ist() -> datetime:
@@ -20,24 +26,13 @@ def today_ist() -> date:
     """Today's date in IST."""
     return now_ist().date()
 
-# ---- CONFIG ----
-CACHE_EXPIRY_HOURS = 24
-FAILURE_COOLDOWN_MINUTES = 5
-QUOTA_COOLDOWN_MINUTES = 60
-DAILY_KEY_LIMIT = 800
-DEAD_KEY_REMOVE_DAYS = 3
 
-
-# ---- Cached Connection (own singleton, no import from db_manager) ----
-# Uses the same @st.cache_resource pattern as db_manager to avoid
-# opening a new connection on every call, without causing a circular import.
-
+# ---- Cached Connection -------------------------------------------------------
 def _get_llm_connection():
     """
     Returns a single cached psycopg2 connection for llm_manager.
     @st.cache_resource ensures it is NOT recreated on every Streamlit rerun.
-    Kept separate from db_manager's connection to avoid circular imports,
-    but uses the same pattern and credentials.
+    Kept separate from db_manager to avoid circular imports.
     """
     import streamlit as st
     conn = psycopg2.connect(
@@ -55,7 +50,6 @@ def _get_llm_connection():
     conn.autocommit = False
     return conn
 
-# Wrap with cache_resource at module level
 try:
     import streamlit as st
     _get_llm_connection = st.cache_resource(_get_llm_connection)
@@ -64,10 +58,7 @@ except Exception:
 
 
 def get_conn():
-    """
-    Returns the cached connection.
-    Reconnects automatically if the connection was dropped.
-    """
+    """Returns the cached connection, reconnecting if dropped."""
     conn = _get_llm_connection()
     try:
         conn.isolation_level  # lightweight liveness check
@@ -81,25 +72,7 @@ def get_conn():
     return conn
 
 
-# ---- Table Setup ----
-# Run once via init_tables() OR paste into Supabase SQL Editor:
-#
-# CREATE TABLE IF NOT EXISTS llm_cache (
-#     prompt_hash TEXT PRIMARY KEY,
-#     response    TEXT,
-#     timestamp   TIMESTAMPTZ DEFAULT NOW()
-# );
-# CREATE TABLE IF NOT EXISTS key_failures (
-#     api_key   TEXT PRIMARY KEY,
-#     fail_time TIMESTAMPTZ,
-#     reason    TEXT
-# );
-# CREATE TABLE IF NOT EXISTS key_usage (
-#     api_key     TEXT PRIMARY KEY,
-#     usage_count INTEGER DEFAULT 0,
-#     last_reset  DATE
-# );
-
+# ---- Table Setup -------------------------------------------------------------
 def init_tables():
     """Create the 3 llm_manager tables in Supabase if they don't exist."""
     conn = get_conn()
@@ -128,7 +101,7 @@ def init_tables():
         raise e
 
 
-# ---- Auto-clean expired cache ----
+# ---- Auto-clean expired cache ------------------------------------------------
 def cleanup_cache():
     """Delete expired cache rows and permanently dead key records."""
     cutoff      = now_ist() - timedelta(hours=CACHE_EXPIRY_HOURS)
@@ -143,31 +116,34 @@ def cleanup_cache():
         conn.rollback()
 
 
-# ---- Load API Keys ----
-def load_groq_api_keys():
+# ---- Load API Keys -----------------------------------------------------------
+def load_groq_api_keys() -> list:
+    """
+    Load admin API keys in a STABLE, DETERMINISTIC order.
+    No shuffling here — rotation is handled entirely by session["key_index"].
+    Shuffling at load time would make the index meaningless across calls.
+    """
     try:
         import streamlit as st
         secret_keys = st.secrets.get("GROQ_API_KEYS", "")
         if secret_keys:
             keys = [k.strip() for k in secret_keys.split(",") if k.strip()]
-            random.shuffle(keys)
-            return keys
+            return keys  # ← NO shuffle — stable order for round-robin
     except Exception:
         pass
     env_keys = os.getenv("GROQ_API_KEYS", "")
     if env_keys:
         keys = [k.strip() for k in env_keys.split(",") if k.strip()]
-        random.shuffle(keys)
-        return keys
+        return keys      # ← NO shuffle — stable order for round-robin
     raise ValueError("❌ No Groq API keys found.")
 
 
-# ---- Hash Prompt ----
+# ---- Hash Prompt -------------------------------------------------------------
 def hash_prompt(prompt: str, model: str) -> str:
     return hashlib.sha256(f"{model}|{prompt}".encode("utf-8")).hexdigest()
 
 
-# ---- Cache Handling ----
+# ---- Cache Handling ----------------------------------------------------------
 def get_cached_response(prompt: str, model: str):
     """Return a valid cached LLM response, or None if not found / expired."""
     key    = hash_prompt(prompt, model)
@@ -203,7 +179,7 @@ def set_cached_response(prompt: str, model: str, response: str):
         conn.rollback()
 
 
-# ---- Key Tracking ----
+# ---- Key Tracking ------------------------------------------------------------
 def increment_key_usage(api_key: str):
     """Increment daily usage for a key, resetting count if it's a new IST day."""
     today = today_ist()
@@ -240,7 +216,7 @@ def increment_key_usage(api_key: str):
 
 
 def mark_key_failure(api_key: str, reason: str = "error"):
-    """Record or update a key failure with IST timestamp."""
+    """Record or update a key failure with IST timestamp (Python-side, not SQL NOW())."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -269,8 +245,12 @@ def clear_key_failure(api_key: str):
 
 def get_healthy_keys(api_keys: list) -> list:
     """
-    Return keys not in active cooldown and under daily quota.
-    Uses 2 bulk queries to avoid N+1 database calls.
+    Return keys not in active cooldown and under daily IST quota.
+
+    IMPORTANT: Returns keys in the SAME ORDER as api_keys (no shuffle).
+    This preserves the round-robin sequence tracked by session["key_index"].
+    Shuffling here would make the stored index point to a different key on
+    every call, breaking rotation entirely.
     """
     now   = now_ist()
     today = today_ist()
@@ -284,9 +264,8 @@ def get_healthy_keys(api_keys: list) -> list:
             cur.execute("SELECT api_key, usage_count, last_reset FROM key_usage")
             usage_map = {r["api_key"]: r for r in cur.fetchall()}
     except Exception:
-        shuffled = list(api_keys)
-        random.shuffle(shuffled)
-        return shuffled
+        # DB unavailable — return all keys as-is (no shuffle, preserve order)
+        return list(api_keys)
 
     healthy = []
     for key in api_keys:
@@ -296,14 +275,14 @@ def get_healthy_keys(api_keys: list) -> list:
             reason    = failures[key]["reason"]
             if isinstance(fail_time, str):
                 fail_time = datetime.fromisoformat(fail_time)
-            # Normalise to IST-aware for correct comparison
+            # Normalise to IST-aware for comparison
             if fail_time.tzinfo is None:
                 fail_time = fail_time.replace(tzinfo=timezone.utc).astimezone(IST)
             else:
                 fail_time = fail_time.astimezone(IST)
             cooldown_mins = QUOTA_COOLDOWN_MINUTES if reason == "quota" else FAILURE_COOLDOWN_MINUTES
             if (now - fail_time).total_seconds() < cooldown_mins * 60:
-                continue
+                continue  # still in cooldown — skip
 
         # --- Daily quota check (IST date) ---
         if key in usage_map:
@@ -313,35 +292,52 @@ def get_healthy_keys(api_keys: list) -> list:
                 last_reset = datetime.strptime(last_reset, "%Y-%m-%d").date()
             if last_reset == today and usage_count >= DAILY_KEY_LIMIT:
                 mark_key_failure(key, "quota")
-                continue
+                continue  # daily limit hit — skip
 
         healthy.append(key)
 
-    random.shuffle(healthy)
+    # ← NO random.shuffle() here — order must be stable for round-robin
     return healthy
 
 
-# ---- LLM Call ----
+# ---- LLM Call ----------------------------------------------------------------
 def try_call_llm(prompt: str, api_key: str, model: str, temperature: float) -> str:
     """Make a single LLM call via Groq."""
     llm = ChatGroq(model=model, temperature=temperature, groq_api_key=api_key)
     return llm.invoke(prompt).content
 
 
-# ---- Main Entry Point ----
-def call_llm(prompt: str, session, model: str = "llama-3.3-70b-versatile", temperature: float = 0) -> str:
+# ---- Main Entry Point --------------------------------------------------------
+def call_llm(
+    prompt: str,
+    session,
+    model: str = "llama-3.3-70b-versatile",
+    temperature: float = 0,
+) -> str:
     """
-    Main LLM call with:
-    1. Cache check       (Supabase llm_cache table)
-    2. User key attempt  (from session["user_groq_key"])
-    3. Admin key rotation with per-key cooldown + daily quota tracking
+    Main LLM call with proper round-robin key rotation:
+
+    1. Cache check        — return immediately if cached (Supabase llm_cache)
+    2. User key           — try session["user_groq_key"] first if provided
+    3. Admin key rotation — true round-robin via session["key_index"]
+                            Keys are loaded in stable order; index advances
+                            after each successful call so the NEXT call starts
+                            from the key after the one that just succeeded.
+
+    Rotation design:
+    - load_groq_api_keys()  → stable list, no shuffle
+    - get_healthy_keys()    → filters cooldown/quota, preserves order
+    - session["key_index"]  → position in the FULL (unfiltered) list
+    - We find where to start in healthy[] by locating the first healthy key
+      whose index in the full list is >= session["key_index"], wrapping around.
+      This means failed/cooldown keys are simply skipped without resetting progress.
     """
-    # Step 1: Cleanup once per session
+    # ── Step 1: cleanup once per session ─────────────────────────────────────
     if not session.get("_cache_cleaned"):
         cleanup_cache()
         session["_cache_cleaned"] = True
 
-    # Step 2: Cache lookup
+    # ── Step 2: cache lookup ──────────────────────────────────────────────────
     cached = get_cached_response(prompt, model)
     if cached:
         return cached
@@ -353,7 +349,7 @@ def call_llm(prompt: str, session, model: str = "llama-3.3-70b-versatile", tempe
     user_key   = user_key.strip() if isinstance(user_key, str) else ""
     last_error = None
 
-    # Step 3: Try user-provided key first
+    # ── Step 3: try user-provided key first ───────────────────────────────────
     if user_key:
         try:
             response = try_call_llm(prompt, user_key, model, temperature)
@@ -365,23 +361,42 @@ def call_llm(prompt: str, session, model: str = "llama-3.3-70b-versatile", tempe
             mark_key_failure(user_key, reason)
             last_error = e
 
-    # Step 4: Rotate through admin keys
-    admin_keys = get_healthy_keys(load_groq_api_keys())
-    if admin_keys:
-        start_index = session["key_index"] % len(admin_keys)
-        for offset in range(len(admin_keys)):
-            idx = (start_index + offset) % len(admin_keys)
-            key = admin_keys[idx]
-            try:
-                response = try_call_llm(prompt, key, model, temperature)
-                set_cached_response(prompt, model, response)
-                increment_key_usage(key)
-                clear_key_failure(key)
-                session["key_index"] = (idx + 1) % len(admin_keys)
-                return response
-            except Exception as e:
-                reason = "quota" if any(w in str(e).lower() for w in ["quota", "rate limit", "429"]) else "error"
-                mark_key_failure(key, reason)
-                last_error = e
+    # ── Step 4: round-robin through admin keys ────────────────────────────────
+    all_keys    = load_groq_api_keys()          # stable, deterministic order
+    healthy     = get_healthy_keys(all_keys)    # filtered, same order preserved
+    n_all       = len(all_keys)
+    n_healthy   = len(healthy)
 
-    return f"❌ LLM unavailable: {last_error or 'No healthy API keys available'}"
+    if not healthy:
+        return f"❌ LLM unavailable: {last_error or 'No healthy API keys available'}"
+
+    # Build a lookup: key → its position in all_keys
+    all_key_pos = {k: i for i, k in enumerate(all_keys)}
+
+    # Find the start position in healthy[] — the first key whose global index
+    # is >= session["key_index"] (wrapping). This skips failed keys seamlessly.
+    start_offset = 0
+    current_index = session["key_index"] % n_all
+    for i, k in enumerate(healthy):
+        if all_key_pos.get(k, 0) >= current_index:
+            start_offset = i
+            break
+    # If no key found at/after current_index, wrap around (start_offset stays 0)
+
+    for offset in range(n_healthy):
+        idx = (start_offset + offset) % n_healthy
+        key = healthy[idx]
+        try:
+            response = try_call_llm(prompt, key, model, temperature)
+            set_cached_response(prompt, model, response)
+            increment_key_usage(key)
+            clear_key_failure(key)
+            # Advance global index PAST this key so next call starts on the next one
+            session["key_index"] = (all_key_pos[key] + 1) % n_all
+            return response
+        except Exception as e:
+            reason = "quota" if any(w in str(e).lower() for w in ["quota", "rate limit", "429"]) else "error"
+            mark_key_failure(key, reason)
+            last_error = e
+
+    return f"❌ LLM unavailable: {last_error or 'All healthy keys failed'}"
