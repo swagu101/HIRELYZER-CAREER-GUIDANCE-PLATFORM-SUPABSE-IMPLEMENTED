@@ -3,7 +3,7 @@ import os
 import random
 import psycopg2
 import psycopg2.extras
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date  # date used for type hints
 from langchain_groq import ChatGroq
 
 # ---- CONFIG ----
@@ -13,18 +13,11 @@ QUOTA_COOLDOWN_MINUTES   = 60
 DAILY_KEY_LIMIT          = 800
 DEAD_KEY_REMOVE_DAYS     = 3
 
-# ── IST timezone (UTC+5:30) ───────────────────────────────────────────────────
-# All timestamps written in IST so Supabase dashboard shows correct local time.
-# Quota resets at midnight IST (not 5:30 AM IST which UTC midnight would give).
-IST = timezone(timedelta(hours=5, minutes=30))
-
-def now_ist() -> datetime:
-    """Current time as a timezone-aware IST datetime."""
-    return datetime.now(IST)
-
-def today_ist() -> date:
-    """Today's date in IST."""
-    return now_ist().date()
+# ── Single source of truth for IST timestamps ─────────────────────────────────
+# FIX: Replaced inline IST/now_ist()/today_ist() definitions with a shared
+#      import from timezone_helper. All files in the project now use the same
+#      stdlib-based IST timezone object — eliminates any pytz vs stdlib mismatch.
+from timezone_helper import IST, now_ist, today_ist
 
 
 # ---- Cached Connection -------------------------------------------------------
